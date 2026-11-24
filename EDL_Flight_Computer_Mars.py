@@ -43,7 +43,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # 1. Mission & Sensor Configuration
 # ---------------------------------------------------------------------------
-BMP280_I2C_ADDRESS = 0x76        # Change to 0x77 if i2cdetect shows 77
+BMP280_I2C_ADDRESS = 0x77        # Change to 0x77 if i2cdetect shows 77
 MPU6050_I2C_ADDRESS = 0x68       # Default address when AD0 pin is unconnected
 LOCAL_SEA_LEVEL_HPA = 1013.25    # Update with local barometric pressure
 SAMPLE_INTERVAL_SEC = 0.1        # 10 Hz loop rate for real-time EDL & terminal descent capture
