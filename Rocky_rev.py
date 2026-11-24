@@ -54,8 +54,8 @@ TEMP_RISE_FAULT_DELTA_C = 2.5    # Blowing warm air or touching BMP280 (+2.5 C) 
 PRESS_RISE_FAULT_DELTA_HPA = 1.5 # Blowing directly on BMP280 (+1.5 hPa) triggers fault
 
 # GPIO Pins Matching Attached Wiring Diagram
-EVENT_LED_PIN = 17               # Physical Pin 11 (Red LED)
-COUNTDOWN_LED_PIN = 27           # Physical Pin 13 (Yellow LED)
+EVENT_LED_PIN = 40               # Physical Pin 11 (Red LED)
+COUNTDOWN_LED_PIN = 38           # Physical Pin 13 (Yellow LED)
 
 # Automated Landing Notification Settings (Optional - fill in to enable email alert at landing)
 ENABLE_EMAIL_ALERT = False
