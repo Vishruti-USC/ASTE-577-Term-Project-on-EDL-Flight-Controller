@@ -1,0 +1,875 @@
+#!/usr/bin/env python3
+"""
+Combined MPU-6050 Strapdown IMU, BMP280 Barometric Telemetry Logger,
+Status LEDs, Landing-Warning LED & Elapsed-Time Window
+Target: Raspberry Pi 3B+
+
+Wiring (Raspberry Pi 3B+ Physical Header Pins):
+  MPU-6050:
+    VCC -> Pin 04 (5V)
+    GND -> Pin 06 (GND)
+    SCL -> Pin 05 (GPIO 3 / I2C1 SCL)
+    SDA -> Pin 03 (GPIO 2 / I2C1 SDA)
+    INT -> Unconnected
+
+  BMP280:
+    VCC -> Pin 01 (3.3V)
+    GND -> Pin 09 (GND)
+    SCL -> Pin 05 (GPIO 3 / I2C1 SCL - shared with MPU-6050)
+    SDA -> Pin 03 (GPIO 2 / I2C1 SDA - shared with MPU-6050)
+
+  Status LED:
+    GPIO 4 (Pin 07) -> 330 ohm resistor -> LED anode (long leg)
+    LED cathode (short leg) -> Pin 14 (GND)
+
+  Landing-warning LED (LED 2):
+    GPIO 17 (Pin 11) -> 330 ohm resistor -> LED anode (long leg)
+    LED cathode (short leg) -> any GND pin (Pin 14 is fine, shared with LED 1)
+
+  Landing logic (barometric):
+    The altitude at the end of calibration is taken as the release point, DROP_HEIGHT_M
+    (50 m) above the ground, so  AGL = 50 m + (BMP280 altitude - calibration altitude).
+    When AGL <= LANDING_ALT_M (49.5 m) LED 2 starts blinking (2 Hz) and stays blinking.
+    Calibrate at the release height, not on the ground.
+
+  Elapsed-time window:
+    A separate window shows seconds since the program started, for the whole run.
+    Needs a desktop session (DISPLAY) and:  sudo apt install -y python3-tk
+
+  LED 1 patterns:
+    fast blink (5 Hz)   : calibrating - keep the package still
+    slow blink (0.5 Hz) : logging, normal flight
+    solid ON            : free fall detected
+    very fast blink     : error / shutting down on a fault
+    OFF                 : stopped
+
+Dependencies:
+  sudo raspi-config  # Interface Options -> I2C -> Enable
+  sudo apt install -y python3-smbus i2c-tools
+  pip3 install mpu6050-raspberrypi adafruit-circuitpython-bmp280
+  sudo apt install -y python3-rpi.gpio   # usually preinstalled on Raspberry Pi OS
+"""
+
+import argparse
+import csv
+import math
+import os
+import subprocess
+import sys
+import time
+
+# ---------------------------------------------------------------------------
+# Sensor Configuration Constants
+# ---------------------------------------------------------------------------
+MPU_DEFAULT_ADDRESS = 0x68
+BMP_DEFAULT_ADDRESS = 0x76       # Use 0x77 if i2cdetect shows 77
+I2C_BUS_NUMBER = 1
+
+LOCAL_SEA_LEVEL_HPA = 1013.25    # Update with local barometric pressure
+BMP_SAMPLE_INTERVAL_SEC = 0.5    # 2 Hz non-blocking polling for BMP280
+PRINT_INTERVAL_SEC = 0.25        # 4 Hz terminal readout
+
+LED_PIN_BCM = 4                  # BCM numbering -> physical Pin 07
+LAND_LED_PIN_BCM = 17            # BCM numbering -> physical Pin 11
+
+DROP_HEIGHT_M = 50.0             # release point height above the ground
+LANDING_ALT_M = 49.5             # landing trigger: altitude above ground level
+# (seconds ON, seconds OFF); OFF=None means solid ON, ON=None means solid OFF
+LED_PATTERNS = {
+    "off": (None, 0.0),
+    "calibrating": (0.1, 0.1),   # fast blink
+    "logging": (1.0, 1.0),       # same 1 s on / 1 s off cadence as LED_Blink.py
+    "freefall": (0.0, None),     # solid ON
+    "error": (0.05, 0.05),       # very fast blink
+    "landing": (0.25, 0.25),     # 2 Hz blink for the landing-warning LED
+}
+
+ACCEL_RANGE_G = 8
+GYRO_RANGE_DPS = 2000
+DLPF_CODE_98HZ = 0x02
+
+GRAVITY = 9.80665                # m/s^2
+KP_TILT = 2.0
+
+STATIONARY_ACCEL_TOL = 0.12 * GRAVITY
+STATIONARY_GYRO_TOL = math.radians(4.0)
+
+TILT_ACCEL_TOL = 0.25 * GRAVITY
+TILT_GYRO_TOL = math.radians(30.0)
+
+FREEFALL_SPECIFIC_FORCE = 0.30 * GRAVITY
+ANG_ACC_WINDOW = 5
+MAX_DT = 0.05                    # s; ignore stalled loop step
+
+
+# ---------------------------------------------------------------------------
+# Vector & Quaternion Math Utilities
+# ---------------------------------------------------------------------------
+def vadd(a, b):
+    return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
+
+
+def vsub(a, b):
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def vscale(a, s):
+    return (a[0] * s, a[1] * s, a[2] * s)
+
+
+def vdot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def vcross(a, b):
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+
+def vnorm(a):
+    return math.sqrt(vdot(a, a))
+
+
+def vnormalize(a):
+    n = vnorm(a)
+    if n < 1e-12:
+        return (0.0, 0.0, 0.0)
+    return vscale(a, 1.0 / n)
+
+
+def vmean(samples):
+    n = float(len(samples))
+    return (
+        sum(s[0] for s in samples) / n,
+        sum(s[1] for s in samples) / n,
+        sum(s[2] for s in samples) / n,
+    )
+
+
+def quat_normalize(q):
+    n = math.sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3])
+    if n < 1e-12:
+        return (1.0, 0.0, 0.0, 0.0)
+    return (q[0] / n, q[1] / n, q[2] / n, q[3] / n)
+
+
+def quat_conj(q):
+    return (q[0], -q[1], -q[2], -q[3])
+
+
+def quat_mul(a, b):
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    return (
+        aw * bw - ax * bx - ay * by - az * bz,
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+    )
+
+
+def quat_rotate(q, v):
+    """Rotate a body-frame vector into the world frame."""
+    w, x, y, z = q
+    vx, vy, vz = v
+    tx = 2.0 * (y * vz - z * vy)
+    ty = 2.0 * (z * vx - x * vz)
+    tz = 2.0 * (x * vy - y * vx)
+    return (
+        vx + w * tx + (y * tz - z * ty),
+        vy + w * ty + (z * tx - x * tz),
+        vz + w * tz + (x * ty - y * tx),
+    )
+
+
+def euler_to_quat(roll, pitch, yaw):
+    """Intrinsic ZYX quaternion. q rotates body vectors into the world."""
+    cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
+    cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
+    cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
+    return quat_normalize((
+        cr * cp * cy + sr * sp * sy,
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+    ))
+
+
+def quat_to_euler(q):
+    """Return roll, pitch, yaw in radians."""
+    w, x, y, z = q
+    roll = math.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+    sinp = max(-1.0, min(1.0, 2.0 * (w * y - z * x)))
+    pitch = math.asin(sinp)
+    yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    return (roll, pitch, yaw)
+
+
+def quat_from_accel(specific_force):
+    """Level the world frame to gravity. Yaw is left at zero."""
+    ax, ay, az = specific_force
+    roll = math.atan2(ay, az)
+    pitch = math.atan2(-ax, math.sqrt(ay * ay + az * az))
+    return euler_to_quat(roll, pitch, 0.0)
+
+
+def quat_integrate(q, omega, dt):
+    """Exact step for a body-frame rate assumed constant over dt."""
+    ox, oy, oz = omega
+    mag = math.sqrt(ox * ox + oy * oy + oz * oz)
+    half = 0.5 * mag * dt
+    if mag < 1e-12:
+        return quat_normalize(q)
+    s = math.sin(half) / mag
+    dq = (math.cos(half), ox * s, oy * s, oz * s)
+    return quat_normalize(quat_mul(q, dq))
+
+
+def _lin_acc(q, specific_force, gravity):
+    """Kinematic acceleration in the world frame: a = R f + (0, 0, -g)."""
+    f_world = quat_rotate(q, specific_force)
+    return (f_world[0], f_world[1], f_world[2] - gravity)
+
+
+# ---------------------------------------------------------------------------
+# Strapdown Inertial Estimator (MPU-6050)
+# ---------------------------------------------------------------------------
+class InertialEstimator:
+    """Integrate bias-corrected specific force and angular rate."""
+
+    def __init__(self, gravity=GRAVITY):
+        self.gravity = gravity
+        self.q = (1.0, 0.0, 0.0, 0.0)
+        self.lin_vel = (0.0, 0.0, 0.0)
+        self.lin_pos = (0.0, 0.0, 0.0)
+        self.t_prev = None
+        self.omega_prev = (0.0, 0.0, 0.0)
+        self._alpha_hist = []
+
+    def align(self, specific_force):
+        self.q = quat_from_accel(specific_force)
+        self.lin_vel = (0.0, 0.0, 0.0)
+        self.lin_pos = (0.0, 0.0, 0.0)
+        self.t_prev = None
+        self._alpha_hist = []
+
+    def update(self, specific_force, omega, timestamp):
+        if self.t_prev is None:
+            self.t_prev = timestamp
+            self.omega_prev = omega
+            return self._state(specific_force, omega, (0.0, 0.0, 0.0), False, True)
+
+        dt = timestamp - self.t_prev
+        if dt <= 0.0 or dt > MAX_DT:
+            self.t_prev = timestamp
+            self.omega_prev = omega
+            return self._state(specific_force, omega, (0.0, 0.0, 0.0), False, False)
+
+        f_mag = vnorm(specific_force)
+        w_mag = vnorm(omega)
+        freefall = f_mag < FREEFALL_SPECIFIC_FORCE
+        stationary = (
+            abs(f_mag - self.gravity) < STATIONARY_ACCEL_TOL
+            and w_mag < STATIONARY_GYRO_TOL
+        )
+        tilt_ok = (
+            abs(f_mag - self.gravity) < TILT_ACCEL_TOL
+            and w_mag < TILT_GYRO_TOL
+        )
+
+        omega_used = omega
+        if tilt_ok:
+            up_body = quat_rotate(quat_conj(self.q), (0.0, 0.0, 1.0))
+            error = vcross(vnormalize(specific_force), up_body)
+            omega_used = vadd(omega, vscale(error, KP_TILT))
+
+        self.q = quat_integrate(self.q, omega_used, dt)
+        lin_acc = _lin_acc(self.q, specific_force, self.gravity)
+
+        if stationary:
+            self.lin_vel = (0.0, 0.0, 0.0)
+        else:
+            v_new = vadd(self.lin_vel, vscale(lin_acc, dt))
+            self.lin_pos = vadd(
+                self.lin_pos,
+                vscale(vadd(self.lin_vel, v_new), 0.5 * dt),
+            )
+            self.lin_vel = v_new
+
+        ang_acc = vscale(vsub(omega, self.omega_prev), 1.0 / dt)
+        self._alpha_hist.append(ang_acc)
+        if len(self._alpha_hist) > ANG_ACC_WINDOW:
+            self._alpha_hist.pop(0)
+        ang_acc_avg = vmean(self._alpha_hist)
+
+        self.t_prev = timestamp
+        self.omega_prev = omega
+        return self._state(specific_force, omega, ang_acc_avg, freefall, stationary)
+
+    def _state(self, specific_force, omega, ang_acc, freefall, stationary):
+        return {
+            "lin_acc": _lin_acc(self.q, specific_force, self.gravity),
+            "lin_vel": self.lin_vel,
+            "lin_pos": self.lin_pos,
+            "ang_acc": ang_acc,
+            "ang_vel": omega,
+            "ang_disp": quat_to_euler(self.q),
+            "specific_force": specific_force,
+            "freefall": freefall,
+            "stationary": stationary,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Landing Trigger
+# ---------------------------------------------------------------------------
+def agl_from_baro(drop_height_m, rel_alt_m):
+    """Altitude above ground. rel_alt_m is 0 at the release point and negative below it."""
+    return drop_height_m + rel_alt_m
+
+
+def landing_triggered(agl_m, landing_alt_m):
+    return agl_m <= landing_alt_m
+
+
+# ---------------------------------------------------------------------------
+# Elapsed-Time Window (separate process, so it never slows the IMU loop)
+# ---------------------------------------------------------------------------
+def run_timer_window(start_epoch, parent_pid):
+    """Tk window showing seconds since start_epoch. Closes itself if the logger exits."""
+    import tkinter as tk
+
+    root = tk.Tk()
+    root.title("Mission Timer")
+    root.configure(bg="black")
+    root.geometry("460x260+80+80")
+    try:
+        root.attributes("-topmost", True)
+    except tk.TclError:
+        pass
+
+    value = tk.Label(root, text="0.0", font=("Helvetica", 96, "bold"), fg="white", bg="black")
+    value.pack(expand=True)
+    unit = tk.Label(root, text="seconds", font=("Helvetica", 20), fg="gray70", bg="black")
+    unit.pack(pady=(0, 18))
+
+    def tick():
+        if os.getppid() != parent_pid:      # logger exited or was killed
+            root.destroy()
+            return
+        value.config(text="{:.1f}".format(time.time() - start_epoch))
+        root.after(50, tick)
+
+    tick()
+    root.mainloop()
+
+
+def start_timer_window(start_epoch):
+    """Open the timer window in a child process. Returns the Popen handle, or None."""
+    try:
+        import tkinter  # noqa: F401
+    except ImportError:
+        print("WARNING: tkinter missing - timer window disabled.\n"
+              "  Run: sudo apt install -y python3-tk")
+        return None
+    if sys.platform.startswith("linux") and not (
+        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    ):
+        print("WARNING: no display found (plain SSH session?) - timer window disabled.")
+        return None
+    try:
+        return subprocess.Popen([
+            sys.executable, os.path.abspath(__file__),
+            "--timer-window", "{:.3f}".format(start_epoch),
+            "--timer-parent", str(os.getpid()),
+        ])
+    except OSError as exc:
+        print(f"WARNING: could not open timer window ({exc}).")
+        return None
+
+
+def stop_timer_window(proc):
+    if proc is None:
+        return
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+# ---------------------------------------------------------------------------
+# Status LED (non-blocking)
+# ---------------------------------------------------------------------------
+class StatusLED:
+    """Time-based LED driver. Call update() every loop; it never sleeps,
+    so it cannot stall the IMU integration loop."""
+
+    def __init__(self, pin, enabled=True):
+        self.pin = pin
+        self.gpio = None
+        self.mode = "off"
+        self._state = False
+        self._next_toggle = 0.0
+        if not enabled:
+            return
+        try:
+            import RPi.GPIO as GPIO   # note: package name is RPi, not RPI
+        except ImportError:
+            print("WARNING: RPi.GPIO not available - status LED disabled.")
+            return
+        try:
+            GPIO.setwarnings(False)
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
+            self.gpio = GPIO
+        except Exception as exc:
+            print(f"WARNING: could not set up LED on GPIO {pin} ({exc}) - LED disabled.")
+
+    def _write(self, on):
+        self._state = on
+        if self.gpio is not None:
+            self.gpio.output(self.pin, self.gpio.HIGH if on else self.gpio.LOW)
+
+    def set_mode(self, mode, now=None):
+        if mode == self.mode:
+            return
+        self.mode = mode
+        on_s, off_s = LED_PATTERNS[mode]
+        if on_s is None:                      # solid OFF
+            self._write(False)
+        elif off_s is None:                   # solid ON
+            self._write(True)
+        else:                                 # start a blink cycle with ON
+            self._write(True)
+            now = time.perf_counter() if now is None else now
+            self._next_toggle = now + on_s
+
+    def update(self, now):
+        on_s, off_s = LED_PATTERNS[self.mode]
+        if on_s is None or off_s is None or now < self._next_toggle:
+            return
+        if self._state:
+            self._write(False)
+            self._next_toggle = now + off_s
+        else:
+            self._write(True)
+            self._next_toggle = now + on_s
+
+    def close(self):
+        if self.gpio is not None:
+            try:
+                self._write(False)
+                self.gpio.cleanup(self.pin)
+            except Exception:
+                pass
+            self.gpio = None
+
+
+# ---------------------------------------------------------------------------
+# Hardware Initialization & Readers
+# ---------------------------------------------------------------------------
+def configure_mpu6050(sensor):
+    accel_ranges = {
+        2: sensor.ACCEL_RANGE_2G,
+        4: sensor.ACCEL_RANGE_4G,
+        8: sensor.ACCEL_RANGE_8G,
+        16: sensor.ACCEL_RANGE_16G,
+    }
+    gyro_ranges = {
+        250: sensor.GYRO_RANGE_250DEG,
+        500: sensor.GYRO_RANGE_500DEG,
+        1000: sensor.GYRO_RANGE_1000DEG,
+        2000: sensor.GYRO_RANGE_2000DEG,
+    }
+    sensor.set_accel_range(accel_ranges[ACCEL_RANGE_G])
+    sensor.set_gyro_range(gyro_ranges[GYRO_RANGE_DPS])
+    if hasattr(sensor, "set_filter_range"):
+        sensor.set_filter_range(DLPF_CODE_98HZ)
+
+
+def open_mpu6050(address, bus):
+    try:
+        from mpu6050 import mpu6050
+    except ImportError as exc:
+        raise SystemExit(
+            "Missing mpu6050 library. Run:\n"
+            "  sudo apt install -y python3-smbus i2c-tools\n"
+            "  pip3 install mpu6050-raspberrypi"
+        ) from exc
+
+    try:
+        sensor = mpu6050(address, bus=bus)
+        configure_mpu6050(sensor)
+        return sensor
+    except Exception as exc:
+        raise SystemExit(
+            f"Failed to initialize MPU-6050 at 0x{address:02X} on I2C bus {bus}.\n"
+            "Verify Pin 03 (SDA), Pin 05 (SCL), Pin 04 (5V), Pin 06 (GND) with `sudo i2cdetect -y 1`."
+        ) from exc
+
+
+def open_bmp280(address, sea_level_hpa):
+    try:
+        import board
+        import adafruit_bmp280
+    except ImportError as exc:
+        raise SystemExit(
+            "Missing Adafruit BMP280 library. Run:\n"
+            "  pip3 install adafruit-circuitpython-bmp280"
+        ) from exc
+
+    try:
+        i2c = board.I2C()  # Uses Pin 03 (SDA) and Pin 05 (SCL)
+        bmp = adafruit_bmp280.Adafruit_BMP280_I2C(i2c, address=address)
+        bmp.sea_level_pressure = sea_level_hpa
+        return bmp
+    except Exception as exc:
+        raise SystemExit(
+            f"Failed to initialize BMP280 at 0x{address:02X}.\n"
+            "Verify Pin 01 (3.3V), Pin 09 (GND), Pin 03 (SDA), and Pin 05 (SCL—not Pin 23) "
+            "with `sudo i2cdetect -y 1`."
+        ) from exc
+
+
+def read_mpu6050(sensor):
+    """Return specific force (m/s^2) and angular rate (rad/s)."""
+    accel = sensor.get_accel_data(g=False)
+    gyro = sensor.get_gyro_data()
+    specific_force = (accel["x"], accel["y"], accel["z"])
+    omega = (
+        math.radians(gyro["x"]),
+        math.radians(gyro["y"]),
+        math.radians(gyro["z"]),
+    )
+    return specific_force, omega
+
+
+def read_bmp280(bmp, baseline_alt_m=0.0):
+    """Return latest pressure (hPa), temperature (C), and altitudes (m)."""
+    pressure_hpa = bmp.pressure
+    temp_c = bmp.temperature
+    est_alt_m = bmp.altitude
+    return {
+        "pressure_hpa": pressure_hpa,
+        "temp_c": temp_c,
+        "est_alt_m": est_alt_m,
+        "rel_alt_m": est_alt_m - baseline_alt_m,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Calibration, Formatting & Logging Loop
+# ---------------------------------------------------------------------------
+CSV_HEADER = [
+    "t_s",
+    "ax_mps2", "ay_mps2", "az_mps2",
+    "vx_mps", "vy_mps", "vz_mps",
+    "px_m", "py_m", "pz_m",
+    "alphax_radps2", "alphay_radps2", "alphaz_radps2",
+    "wx_radps", "wy_radps", "wz_radps",
+    "roll_rad", "pitch_rad", "yaw_rad",
+    "fx_mps2", "fy_mps2", "fz_mps2",
+    "freefall", "stationary",
+    "pressure_hpa", "temp_c", "est_alt_m", "rel_alt_m",
+    "agl_m", "landing_led",
+]
+
+
+def state_row(t, state, bmp_data, agl_m, landing_on):
+    a, v, p = state["lin_acc"], state["lin_vel"], state["lin_pos"]
+    al, w, ang = state["ang_acc"], state["ang_vel"], state["ang_disp"]
+    f = state["specific_force"]
+    return [
+        round(t, 4),
+        a[0], a[1], a[2],
+        v[0], v[1], v[2],
+        p[0], p[1], p[2],
+        al[0], al[1], al[2],
+        w[0], w[1], w[2],
+        ang[0], ang[1], ang[2],
+        f[0], f[1], f[2],
+        int(state["freefall"]), int(state["stationary"]),
+        round(bmp_data["pressure_hpa"], 2),
+        round(bmp_data["temp_c"], 2),
+        round(bmp_data["est_alt_m"], 2),
+        round(bmp_data["rel_alt_m"], 3),
+        round(agl_m, 3), int(landing_on),
+    ]
+
+
+def format_telemetry(t, state, bmp_data, agl_m, landing_on, landing_alt_m):
+    a, v, p = state["lin_acc"], state["lin_vel"], state["lin_pos"]
+    al, w, ang = state["ang_acc"], state["ang_vel"], state["ang_disp"]
+    if state["freefall"]:
+        phase = "FREE FALL"
+    elif state["stationary"]:
+        phase = "STILL"
+    else:
+        phase = "MOVING"
+
+    return (
+        "t={:7.3f} s  [{}]\n"
+        "  lin acc   m/s^2    {:+9.3f} {:+9.3f} {:+9.3f}\n"
+        "  lin vel   m/s      {:+9.3f} {:+9.3f} {:+9.3f}\n"
+        "  lin disp  m        {:+9.3f} {:+9.3f} {:+9.3f}\n"
+        "  ang acc   rad/s^2  {:+9.3f} {:+9.3f} {:+9.3f}\n"
+        "  ang vel   rad/s    {:+9.3f} {:+9.3f} {:+9.3f}\n"
+        "  ang disp  deg      {:+9.2f} {:+9.2f} {:+9.2f}\n"
+        "  bmp280             P={:7.2f} hPa | T={:5.2f} C | Alt={:6.2f} m (rel {:+6.2f} m)\n"
+        "  landing            AGL={:6.2f} m | trigger {:5.1f} m | LED2 {}"
+    ).format(
+        t, phase,
+        a[0], a[1], a[2],
+        v[0], v[1], v[2],
+        p[0], p[1], p[2],
+        al[0], al[1], al[2],
+        w[0], w[1], w[2],
+        math.degrees(ang[0]), math.degrees(ang[1]), math.degrees(ang[2]),
+        bmp_data["pressure_hpa"],
+        bmp_data["temp_c"],
+        bmp_data["est_alt_m"],
+        bmp_data["rel_alt_m"],
+        agl_m, landing_alt_m, "BLINKING" if landing_on else "off",
+    )
+
+
+def calibrate_sensors(mpu, bmp, seconds, led=None):
+    """Still-package calibration for MPU-6050 bias and BMP280 baseline altitude."""
+    print(f"Hold the package still for {seconds:.1f} s to calibrate MPU-6050 & BMP280...")
+    time.sleep(0.3)
+
+    forces = []
+    rates = []
+    alt_samples = []
+
+    if led is not None:
+        led.set_mode("calibrating")
+    t_end = time.perf_counter() + seconds
+    next_bmp = 0.0
+    while time.perf_counter() < t_end:
+        now = time.perf_counter()
+        if led is not None:
+            led.update(now)
+        f, w = read_mpu6050(mpu)
+        forces.append(f)
+        rates.append(w)
+        if now >= next_bmp:
+            alt_samples.append(bmp.altitude)
+            next_bmp = now + 0.1
+
+    if len(forces) < 10:
+        raise RuntimeError("Calibration collected too few MPU-6050 samples. Check I2C wiring.")
+
+    mean_f = vmean(forces)
+    mean_w = vmean(rates)
+    f_mag = vnorm(mean_f)
+    if f_mag < 0.5 * GRAVITY:
+        raise RuntimeError(
+            f"Accelerometer magnitude is {f_mag:.2f} m/s^2 during calibration (expected ~9.81 m/s^2)."
+        )
+
+    accel_bias = vsub(mean_f, vscale(vnormalize(mean_f), GRAVITY))
+    baseline_alt_m = sum(alt_samples) / len(alt_samples) if alt_samples else bmp.altitude
+
+    print(f"Calibration complete ({len(forces)} IMU samples, {len(alt_samples)} baro samples):")
+    print("  Gyro bias  (rad/s): {:+.5f} {:+.5f} {:+.5f}".format(*mean_w))
+    print("  Accel bias (m/s^2): {:+.4f} {:+.4f} {:+.4f}".format(*accel_bias))
+    print(f"  Baseline altitude : {baseline_alt_m:.2f} m\n")
+
+    return accel_bias, mean_w, vsub(mean_f, accel_bias), baseline_alt_m
+
+
+def run_logger(mpu, bmp, outfile, calibrate_s, duration, bmp_interval, led=None,
+               land_led=None, drop_height_m=DROP_HEIGHT_M, landing_alt_m=LANDING_ALT_M):
+    accel_bias, gyro_bias, f_align, baseline_alt_m = calibrate_sensors(mpu, bmp, calibrate_s, led)
+    est = InertialEstimator()
+    est.align(f_align)
+
+    bmp_data = read_bmp280(bmp, baseline_alt_m)
+
+    print(f"Release height {drop_height_m:.1f} m above ground (= calibration altitude); "
+          f"landing LED triggers at {landing_alt_m:.1f} m AGL.")
+    print(f"Logging combined telemetry to '{outfile}'. Press Ctrl+C to stop.\n")
+    landing_on = False
+
+    t0 = time.perf_counter()
+    next_bmp_read = t0 + bmp_interval
+    next_print = t0
+    if led is not None:
+        led.set_mode("logging", t0)
+
+    with open(outfile, "w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(CSV_HEADER)
+        try:
+            while True:
+                now = time.perf_counter()
+                elapsed = now - t0
+                if duration > 0.0 and elapsed >= duration:
+                    break
+
+                # Poll BMP280 at 2 Hz without stalling IMU strapdown integration
+                if now >= next_bmp_read:
+                    bmp_data = read_bmp280(bmp, baseline_alt_m)
+                    next_bmp_read = now + bmp_interval
+
+                # Poll MPU-6050 every iteration
+                f_raw, w_raw = read_mpu6050(mpu)
+                f = vsub(f_raw, accel_bias)
+                w = vsub(w_raw, gyro_bias)
+                state = est.update(f, w, now)
+
+                agl_m = agl_from_baro(drop_height_m, bmp_data["rel_alt_m"])
+                if not landing_on and landing_triggered(agl_m, landing_alt_m):
+                    landing_on = True      # latched: keeps blinking until the run ends
+                    print(f"*** LANDING WARNING: AGL {agl_m:.1f} m <= {landing_alt_m:.1f} m "
+                          f"at t={elapsed:.2f} s ***")
+                if land_led is not None:
+                    land_led.set_mode("landing" if landing_on else "off", now)
+                    land_led.update(now)
+
+                if led is not None:
+                    led.set_mode("freefall" if state["freefall"] else "logging", now)
+                    led.update(now)
+
+                writer.writerow(state_row(elapsed, state, bmp_data, agl_m, landing_on))
+                handle.flush()
+
+                if now >= next_print:
+                    print(format_telemetry(elapsed, state, bmp_data, agl_m, landing_on, landing_alt_m))
+                    print("")
+                    next_print = now + PRINT_INTERVAL_SEC
+
+        except KeyboardInterrupt:
+            print("\nLogging stopped by user.")
+        except OSError as exc:
+            # I2C fault (loose wire, brown-out): flag it on the LED, keep the CSV intact
+            if led is not None:
+                led.set_mode("error")
+                t_err = time.perf_counter() + 2.0
+                while time.perf_counter() < t_err:
+                    led.update(time.perf_counter())
+            print(f"\nI/O error during logging: {exc}")
+
+    print(f"Saved combined data to '{outfile}'.")
+
+
+# ---------------------------------------------------------------------------
+# Offline Kinematics Self-Test
+# ---------------------------------------------------------------------------
+def _check(name, ok, detail):
+    if not ok:
+        raise AssertionError(f"{name}: {detail}")
+    print(f"  pass  {name}  ({detail})")
+
+
+def run_self_test():
+    """Verify strapdown math without physical hardware attached."""
+    print("Self-test")
+    g = GRAVITY
+    dt = 0.01
+
+    est = InertialEstimator()
+    est.align((0.0, 0.0, g))
+    t = 0.0
+    fall_t = 1.0
+    steps = int(fall_t / dt)
+    state = est.update((0.0, 0.0, g), (0.0, 0.0, 0.0), t)
+    for _ in range(steps):
+        t += dt
+        state = est.update((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), t)
+    _check("freefall acc", abs(state["lin_acc"][2] + g) < 1e-6, f"az={state['lin_acc'][2]:.5f}")
+    _check("freefall vel", abs(state["lin_vel"][2] + g * fall_t) < 1e-6, f"vz={state['lin_vel'][2]:.5f}")
+    _check("freefall pos", abs(state["lin_pos"][2] + 0.5 * g * fall_t * fall_t) < 1e-6, f"pz={state['lin_pos'][2]:.5f}")
+
+    trig_rel = -(DROP_HEIGHT_M - LANDING_ALT_M)     # rel. altitude at the trigger point
+    for rel_alt, expect in ((0.0, False), (trig_rel + 0.1, False), (trig_rel, True), (trig_rel - 1.0, True)):
+        agl = agl_from_baro(DROP_HEIGHT_M, rel_alt)
+        _check(f"landing trigger at {agl:.1f} m AGL",
+               landing_triggered(agl, LANDING_ALT_M) == expect,
+               f"rel_alt={rel_alt:+.1f} m -> {'LED2 on' if expect else 'LED2 off'}")
+    print("Self-test passed.")
+
+
+# ---------------------------------------------------------------------------
+# Entry Point
+# ---------------------------------------------------------------------------
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Combined MPU-6050 & BMP280 telemetry logger for Raspberry Pi 3B+."
+    )
+    parser.add_argument("--mpu-address", type=lambda s: int(s, 0), default=MPU_DEFAULT_ADDRESS,
+                        help="MPU-6050 I2C address (default 0x68)")
+    parser.add_argument("--bmp-address", type=lambda s: int(s, 0), default=BMP_DEFAULT_ADDRESS,
+                        help="BMP280 I2C address (default 0x76, or 0x77)")
+    parser.add_argument("--bus", type=int, default=I2C_BUS_NUMBER,
+                        help="I2C bus number (default 1 on RPi 3B+)")
+    parser.add_argument("--sea-level", type=float, default=LOCAL_SEA_LEVEL_HPA,
+                        help="Local sea-level pressure in hPa (default 1013.25)")
+    parser.add_argument("--bmp-interval", type=float, default=BMP_SAMPLE_INTERVAL_SEC,
+                        help="BMP280 polling interval in seconds (default 0.5)")
+    parser.add_argument("--calibrate", type=float, default=2.0,
+                        help="Still-calibration duration in seconds (default 2.0)")
+    parser.add_argument("--duration", type=float, default=0.0,
+                        help="Total logging duration in seconds after calibration (0 = until Ctrl+C)")
+    parser.add_argument("--outfile", default="combined_telemetry.csv",
+                        help="Output CSV filename (default combined_telemetry.csv)")
+    parser.add_argument("--led-pin", type=int, default=LED_PIN_BCM,
+                        help="Status LED GPIO pin, BCM numbering (default 4 = physical Pin 07)")
+    parser.add_argument("--no-led", action="store_true",
+                        help="Disable both LEDs")
+    parser.add_argument("--land-led-pin", type=int, default=LAND_LED_PIN_BCM,
+                        help="Landing-warning LED GPIO pin, BCM numbering (default 17 = physical Pin 11)")
+    parser.add_argument("--drop-height", type=float, default=DROP_HEIGHT_M,
+                        help="Release height above ground in m (default 50)")
+    parser.add_argument("--landing-alt", type=float, default=LANDING_ALT_M,
+                        help="Landing trigger altitude above ground in m (default 49.5)")
+    parser.add_argument("--no-timer", action="store_true",
+                        help="Do not open the elapsed-time window")
+    parser.add_argument("--timer-window", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--timer-parent", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--self-test", action="store_true",
+                        help="Run offline math check without sensors")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    if args.timer_window is not None:       # child process: just show the clock
+        run_timer_window(args.timer_window, args.timer_parent)
+        return
+    if args.self_test:
+        run_self_test()
+        return
+    if args.landing_alt >= args.drop_height:
+        raise SystemExit("--landing-alt must be below --drop-height.")
+
+    start_epoch = time.time()
+    timer_proc = None if args.no_timer else start_timer_window(start_epoch)
+    led = StatusLED(args.led_pin, enabled=not args.no_led)
+    land_led = StatusLED(args.land_led_pin, enabled=not args.no_led)
+    try:
+        mpu = open_mpu6050(args.mpu_address, args.bus)
+        bmp = open_bmp280(args.bmp_address, args.sea_level)
+        run_logger(mpu, bmp, args.outfile, args.calibrate, args.duration,
+                   args.bmp_interval, led, land_led, args.drop_height, args.landing_alt)
+    except (SystemExit, RuntimeError):
+        # init/calibration failure: show the error pattern briefly, then re-raise
+        led.set_mode("error")
+        t_err = time.perf_counter() + 2.0
+        while time.perf_counter() < t_err:
+            led.update(time.perf_counter())
+        raise
+    finally:
+        led.close()
+        land_led.close()
+        stop_timer_window(timer_proc)
+
+
+if __name__ == "__main__":
+    main()
