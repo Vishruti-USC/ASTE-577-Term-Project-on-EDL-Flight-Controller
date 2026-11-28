@@ -60,3 +60,16 @@ pip install adafruit-circuitpython-mpu6050
 git checkout main or branch name
 cd /ASTE-577-Term-Project-on-EDL-Flight-Controller
 git pull
+
+
+Updates from Gemini - 
+%% Start Working
+cd ~/ASTE-577-Term-Project-on-EDL-Flight-Controller
+source venv/bin/activate
+
+%% Switch Branches and Pull Updates:
+git checkout main  %% switch out main with whatever branch is needed to be used
+git pull
+
+%% Run Flight Controller Script
+python3 EDL_Flight_Computer_Mars.py
